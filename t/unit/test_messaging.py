@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import socket
 import sys
 import threading
 from collections import defaultdict
@@ -1093,3 +1094,308 @@ class test_Consumer:
         p = self.connection.Consumer()
         p.channel = object()
         assert p.connection is None
+
+
+class test_Consumer_revival:
+
+    def setup_method(self):
+        self.connection = Connection(transport=Transport)
+        self.connection.connect()
+        assert self.connection.connection.connected
+        self.exchange = Exchange('foo', 'direct')
+
+    def _consumer(self, channel, queues, **kwargs):
+        kwargs.setdefault('auto_declare', True)
+        return Consumer(channel, queues, **kwargs)
+
+    def test_revive_restores_consumption_state(self):
+        channel = self.connection.channel()
+        queue = Queue('qname', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [queue])
+        consumer.consume()
+        assert channel.called.count('basic_consume') == 1
+        tags_before = dict(consumer._active_tags)
+
+        # connection is lost and re-established: recovery revives the
+        # consumer onto a fresh channel.
+        channel2 = self.connection.channel()
+        consumer.revive(channel2)
+
+        # the previously registered consumption state must be restored
+        # on the new channel, keeping the original consumer tags.
+        assert consumer.channel is channel2
+        assert channel2.called.count('basic_consume') == 1
+        assert consumer._active_tags == tags_before
+        assert consumer.consuming_from(queue)
+
+    def test_revive_same_channel_is_idempotent(self):
+        channel = self.connection.channel()
+        queue = Queue('qname', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [queue])
+        consumer.consume()
+        tags_before = dict(consumer._active_tags)
+        consumes_before = channel.called.count('basic_consume')
+
+        # a repeated recovery callback for the same channel must not
+        # register duplicate consumers.
+        consumer.revive(channel)
+        consumer.revive(channel)
+
+        assert channel.called.count('basic_consume') == consumes_before
+        assert consumer._active_tags == tags_before
+
+    def test_revive_twice_with_new_channels_moves_consumption(self):
+        channel = self.connection.channel()
+        queue = Queue('qname', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [queue])
+        consumer.consume()
+
+        channel2 = self.connection.channel()
+        consumer.revive(channel2)
+        channel3 = self.connection.channel()
+        consumer.revive(channel3)
+
+        # consumption follows the latest channel, tags stay stable and
+        # are not duplicated on intermediate channels.
+        assert consumer.channel is channel3
+        assert channel2.called.count('basic_consume') == 1
+        assert channel3.called.count('basic_consume') == 1
+        assert list(consumer._active_tags) == ['qname']
+        assert consumer.consuming_from('qname')
+
+    def test_revive_skips_queues_cancelled_since_loss(self):
+        channel = self.connection.channel()
+        q1 = Queue('qname1', self.exchange, 'rkey')
+        q2 = Queue('qname2', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [q1, q2])
+        consumer.consume()
+        assert channel.called.count('basic_consume') == 2
+
+        consumer.cancel_by_queue('qname2')
+        channel2 = self.connection.channel()
+        consumer.revive(channel2)
+
+        # the cancelled queue must not be revived; the surviving one is.
+        assert channel2.called.count('basic_consume') == 1
+        assert consumer.consuming_from('qname1')
+        assert not consumer.consuming_from('qname2')
+        assert 'qname2' not in consumer._queues
+
+    def test_revive_does_not_consume_queues_added_since_loss(self):
+        channel = self.connection.channel()
+        q1 = Queue('qname1', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [q1])
+        consumer.consume()
+
+        # a queue registered while the connection is down is re-declared
+        # on recovery, but only explicitly consumed queues are restored.
+        consumer.add_queue(Queue('qname2', self.exchange, 'rkey'))
+        channel2 = self.connection.channel()
+        consumer.revive(channel2)
+
+        assert channel2.called.count('basic_consume') == 1
+        assert consumer.consuming_from('qname1')
+        assert not consumer.consuming_from('qname2')
+        # the new registrant is not lost: it is bound to the new channel
+        # and can be consumed normally.
+        assert consumer._queues['qname2'].channel is channel2
+        consumer.consume()
+        assert consumer.consuming_from('qname2')
+        assert channel2.called.count('basic_consume') == 2
+
+    def test_ensure_recovers_consumption_before_on_revive(self):
+        channel = self.connection.default_channel
+        queue = Queue('qname', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [queue])
+        consumer.consume()
+        assert channel.called.count('basic_consume') == 1
+        tags_before = dict(consumer._active_tags)
+
+        calls = []
+        revived = []
+
+        def fun():
+            if not calls:
+                calls.append('lost')
+                # simulate the connection dying mid-operation
+                raise self.connection.connection_errors[0](
+                    'simulated connection loss')
+            calls.append('ok')
+            return 'ok'
+
+        def on_revive(new_channel):
+            # the recovery callback must observe the consumer state
+            # already fully restored on the new channel.
+            revived.append((
+                new_channel,
+                consumer.consuming_from(queue),
+                dict(consumer._active_tags),
+            ))
+
+        ensured = self.connection.ensure(
+            consumer, fun, on_revive=on_revive, max_retries=3,
+        )
+        assert ensured() == 'ok'
+        assert calls == ['lost', 'ok']
+
+        # the consumer was revived onto a fresh channel exactly once,
+        # before on_revive ran, with its consumer tag preserved.
+        assert len(revived) == 1
+        new_channel, was_consuming, tags_at_revive = revived[0]
+        assert new_channel is not channel
+        assert consumer.channel is new_channel
+        assert was_consuming
+        assert tags_at_revive == tags_before
+        assert consumer._active_tags == tags_before
+        assert new_channel.called.count('basic_consume') == 1
+
+    def test_revive_does_not_lose_queue_registered_during_recovery(self):
+        channel = self.connection.channel()
+        q1 = Queue('qname1', self.exchange, 'rkey')
+        consumer = self._consumer(channel, [q1])
+        consumer.consume()
+
+        channel2 = self.connection.channel()
+        extra = Queue('qname2', self.exchange, 'rkey')
+        revive_in_declare = threading.Event()
+        finish_revive = threading.Event()
+        errors = []
+
+        original_declare = Consumer.declare
+
+        def hooked_declare(consumer_self):
+            # revive reached its declaration phase while holding the
+            # consumer lock; let the registration thread proceed.
+            revive_in_declare.set()
+            assert finish_revive.wait(5)
+            return original_declare(consumer_self)
+
+        def register():
+            try:
+                assert revive_in_declare.wait(5)
+                finish_revive.set()
+                # blocks on the consumer mutex until revive completes,
+                # then must bind to the revived channel.
+                consumer.add_queue(extra)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        with patch.object(Consumer, 'declare', hooked_declare):
+            registration = threading.Thread(target=register)
+            registration.start()
+            consumer.revive(channel2)
+            registration.join(5)
+
+        assert not errors
+        assert not registration.is_alive()
+        # the concurrently registered queue survived the recovery and is
+        # bound to the revived channel.
+        assert 'qname2' in consumer._queues
+        assert consumer._queues['qname2'].channel is channel2
+        assert consumer.consuming_from('qname1')
+        consumer.consume()
+        assert consumer.consuming_from('qname2')
+
+    def test_revive_concurrent_registration_keeps_state_consistent(self):
+        channel = self.connection.channel()
+        queues = [Queue(f'qname{i}', self.exchange, 'rkey')
+                  for i in range(6)]
+        consumer = self._consumer(channel, queues[:3])
+        consumer.consume()
+
+        new_channel = self.connection.channel()
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def revive_repeatedly():
+            try:
+                barrier.wait()
+                for _ in range(5):
+                    consumer.revive(new_channel)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def register_and_consume():
+            try:
+                barrier.wait()
+                for queue in queues[3:]:
+                    consumer.add_queue(queue)
+                    consumer.consume()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def consume_repeatedly():
+            try:
+                barrier.wait()
+                for _ in range(5):
+                    consumer.consume()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=target)
+            for target in (revive_repeatedly, register_and_consume,
+                           consume_repeatedly)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors
+        # no registration was lost: every queue is known, bound to the
+        # final channel and actively consumed exactly once.
+        expected = {queue.name for queue in queues}
+        assert set(consumer._queues) == expected
+        assert set(consumer._active_tags) == expected
+        assert consumer.channel is new_channel
+        assert all(queue.channel is new_channel
+                   for queue in consumer.queues)
+        assert len(set(consumer._active_tags.values())) == len(expected)
+
+        # repeated recovery on the same channel stays idempotent.
+        consumes = new_channel.called.count('basic_consume')
+        consumer.revive(new_channel)
+        assert new_channel.called.count('basic_consume') == consumes
+        assert set(consumer._active_tags) == expected
+
+    def test_revive_restores_message_flow(self):
+        conn = Connection('memory://')
+        conn.connect()
+        queue = Queue('revive.q', self.exchange, 'rkey')
+        received = []
+
+        def callback(body, message):
+            received.append(body)
+            message.ack()
+
+        consumer = Consumer(conn.default_channel, [queue],
+                            callbacks=[callback])
+        consumer.consume()
+
+        # a message published before the outage waits in the queue.
+        conn.Producer().publish({'n': 1}, exchange=self.exchange,
+                                routing_key='rkey')
+
+        # simulate connection loss: the old default channel is gone and
+        # the next access creates a fresh one, exactly as
+        # Connection._connection_factory arranges after a reconnect.
+        conn.maybe_close_channel(conn.default_channel)
+        conn._default_channel = None
+        consumer.revive(conn.default_channel)
+
+        conn.Producer().publish({'n': 2}, exchange=self.exchange,
+                                routing_key='rkey')
+
+        def drain():
+            try:
+                conn.drain_events(timeout=1)
+            except socket.timeout:
+                pass
+
+        drain()
+        drain()
+        # without a restored consumer both messages would stall in the
+        # queue; the backlog and the new message must both be delivered.
+        assert received == [{'n': 1}, {'n': 2}]
+        conn.close()

@@ -10,7 +10,8 @@ import kombu
 from kombu.connection import ConnectionPool
 
 from .common import (BaseExchangeTypes, BaseFailover, BaseMessage,
-                     BasePriority, BaseTimeToLive, BasicFunctionality)
+                     BasePriority, BaseTimeToLive, BasicFunctionality,
+                     _broker_reachable)
 
 
 def get_connection(hostname, port, vhost):
@@ -104,15 +105,17 @@ class test_PyAMQPMessage(BaseMessage):
 @pytest.mark.flaky(reruns=5, reruns_delay=2)
 class test_PyAMQPConnectionPool:
     def test_publish_confirm_does_not_block(self, confirm_publish_connection):
-        """ . "说明"Tests that the connection pool closes connections in case of an exception.
+        """Tests that the connection pool closes connections in case of an exception.
 
         In case an exception occurs while the connection is in use, the pool should
         close the exception. In case the connection is not closed before releasing it
         back to the pool, the connection would remain in an unusable state, causing
         causing the next publish call to time out or block forever in case no
         timeout is specified.
-        """ . "说明"
+        """
         pool = ConnectionPool(connection=confirm_publish_connection, limit=1)
+        if not _broker_reachable(confirm_publish_connection):
+            pytest.skip('RabbitMQ broker is not reachable')
 
         try:
             with pool.acquire(block=True) as connection:
