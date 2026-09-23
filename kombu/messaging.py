@@ -1,9 +1,9 @@
-""" . "说明"Sending and receiving messages.""" . "说明"
+"""Sending and receiving messages."""
 
 from __future__ import annotations
 
 from itertools import count
-from threading import local
+from threading import RLock, local
 from typing import TYPE_CHECKING
 
 from .common import maybe_declare
@@ -23,7 +23,7 @@ DEFAULT_BATCH_SIZE = 1000
 
 
 class _ProducerBatchState:
-    """ . "说明"State shared by nested batch contexts in one producer thread.""" . "说明"
+    """State shared by nested batch contexts in one producer thread."""
 
     def __init__(self, max_size):
         self.max_size = max_size
@@ -74,7 +74,7 @@ class _ProducerBatchState:
 
 
 class _ProducerBatch:
-    """ . "说明"Context manager returned by :meth:`Producer.batch`.""" . "说明"
+    """Context manager returned by :meth:`Producer.batch`."""
 
     def __init__(self, producer, max_size):
         self.producer = producer
@@ -133,14 +133,14 @@ class _ProducerBatch:
         return None
 
     def flush(self):
-        """ . "说明"Flush messages buffered by the active batch.""" . "说明"
+        """Flush messages buffered by the active batch."""
         if not self.active:
             raise RuntimeError('Publish batch context is not active')
         self.state.flush()
 
 
 class Producer:
-    """ . "说明"Message Producer.
+    """Message Producer.
 
     Arguments:
     ---------
@@ -157,7 +157,7 @@ class Producer:
             :meth:`publish` is used. This callback needs the following
             signature: `(exception, exchange, routing_key, message)`.
             Note that the producer needs to drain events to use this feature.
-    """ . "说明"
+    """
 
     #: Default exchange
     exchange = None
@@ -212,24 +212,24 @@ class Producer:
                 self.auto_declare, self.compression)
 
     def declare(self):
-        """ . "说明"Declare the exchange.
+        """Declare the exchange.
 
         Note:
         ----
             This happens automatically at instantiation when
             the :attr:`auto_declare` flag is enabled.
-        """ . "说明"
+        """
         if self.exchange.name:
             self.exchange.declare()
 
     def maybe_declare(self, entity, retry=False, **retry_policy):
-        """ . "说明"Declare exchange if not already declared during this session.""" . "说明"
+        """Declare exchange if not already declared during this session."""
         if entity:
             return maybe_declare(entity, self.channel, retry, **retry_policy)
 
     @property
     def supports_batch_publish(self):
-        """ . "说明"Return whether the active transport can defer batched publishes.""" . "说明"
+        """Return whether the active transport can defer batched publishes."""
         connection = self.connection
         if connection is None:
             return False
@@ -253,7 +253,7 @@ class Producer:
         return bool(transport_support and configured_support)
 
     def batch(self, max_size=DEFAULT_BATCH_SIZE):
-        """ . "说明"Group normal :meth:`publish` calls into transport-owned batches.
+        """Group normal :meth:`publish` calls into transport-owned batches.
 
         Unsupported transports retain immediate publication.  A successful
         outermost context exit flushes pending messages; an exceptional exit
@@ -262,7 +262,7 @@ class Producer:
         :param max_size: Maximum transport operations to buffer before an
             automatic flush. Must be a positive integer.
         :type max_size: int
-        """ . "说明"
+        """
         if (isinstance(max_size, bool) or
                 not isinstance(max_size, int) or max_size <= 0):
             raise ValueError('max_size must be a positive integer')
@@ -288,7 +288,7 @@ class Producer:
                 retry_policy=None, declare=None, expiration=None, timeout=None,
                 confirm_timeout=None,
                 **properties):
-        """ . "说明"Publish message to the specified exchange.
+        """Publish message to the specified exchange.
 
         Arguments:
         ---------
@@ -321,7 +321,7 @@ class Producer:
             confirm_timeout (float): Set confirm timeout to wait maximum timeout second
                 for message to confirm publishing if the channel is set to confirm publish mode.
             **properties (Any): Additional message properties, see AMQP spec.
-        """ . "说明"
+        """
         _publish = self._publish
 
         declare = [] if declare is None else declare
@@ -401,7 +401,7 @@ class Producer:
     channel = property(_get_channel, _set_channel)
 
     def revive(self, channel):
-        """ . "说明"Revive the producer after connection loss.""" . "说明"
+        """Revive the producer after connection loss."""
         if is_connection(channel):
             connection = channel
             self.__connection__ = connection
@@ -473,7 +473,7 @@ class Producer:
 
 
 class Consumer:
-    """ . "说明"Message consumer.
+    """Message consumer.
 
     Arguments:
     ---------
@@ -485,7 +485,7 @@ class Consumer:
         on_message (Callable): See :attr:`on_message`
         on_decode_error (Callable): see :attr:`on_decode_error`.
         prefetch_count (int): see :attr:`prefetch_count`.
-    """ . "说明"
+    """
 
     ContentDisallowed = ContentDisallowed
 
@@ -571,6 +571,15 @@ class Consumer:
         self.on_message = on_message
         self.tag_prefix = tag_prefix
         self._active_tags = {}
+        # Serializes revive() against consume()/add_queue()/cancel*() so a
+        # reconnection recovery cannot race with a concurrent registration.
+        self._restore_lock = RLock()
+        # Whether the broker must have an active basic_consume for every
+        # registered queue. revive() replays this state on a new channel.
+        self._consuming = False
+        # Channel the consumer was last revived on; used to make repeated
+        # recoveries of the same reconnection idempotent.
+        self._revived_on = None
         if auto_declare is not None:
             self.auto_declare = auto_declare
         if on_decode_error is not None:
@@ -590,43 +599,69 @@ class Consumer:
         self._queues = {q.name: q for q in queues}
 
     def revive(self, channel):
-        """ . "说明"Revive consumer after connection loss.""" . "说明"
-        self._active_tags.clear()
-        channel = self.channel = maybe_channel(channel)
-        # modify dict size while iterating over it is not allowed
-        for qname, queue in list(self._queues.items()):
-            # name may have changed after declare
-            self._queues.pop(qname, None)
-            queue = self._queues[queue.name] = queue(self.channel)
-            queue.revive(channel)
+        """Revive consumer after connection loss.
 
-        if self.auto_declare:
-            self.declare()
+        Replays the previously registered consumption state on the new
+        channel: queues are re-bound, redeclared, and basic_consume is
+        re-issued for every queue that was actively consumed before the
+        connection was lost.
 
-        if self.prefetch_count is not None:
-            self.qos(prefetch_count=self.prefetch_count)
+        Safe to call repeatedly for the same reconnection (e.g. when
+        several retry paths both trigger recovery): it is idempotent and
+        serialized with :meth:`consume`/:meth:`add_queue`, so a queue or
+        callback registered concurrently with a reconnection is never
+        lost or registered twice.
+        """
+        with self._restore_lock:
+            new_channel = maybe_channel(channel)
+            # Idempotent: a repeated recovery for the same channel only
+            # re-declares/re-consumes once.
+            if new_channel is self.channel and self._revived_on is new_channel:
+                return
+            channel = self.channel = new_channel
+            self._revived_on = new_channel
+            # The old channel is gone, so every tag it knew about is stale.
+            self._active_tags.clear()
+            # modify dict size while iterating over it is not allowed
+            for qname, queue in list(self._queues.items()):
+                # name may have changed after declare
+                self._queues.pop(qname, None)
+                queue = self._queues[queue.name] = queue(self.channel)
+                queue.revive(channel)
+
+            if self.auto_declare:
+                self.declare()
+
+            if self.prefetch_count is not None:
+                self.qos(prefetch_count=self.prefetch_count)
+
+            # Replay the consumption state that existed before the
+            # connection dropped, otherwise messages stay unconsumed.
+            if self._consuming and self._queues:
+                self._consume_locked()
 
     def declare(self):
-        """ . "说明"Declare queues, exchanges and bindings.
+        """Declare queues, exchanges and bindings.
 
         Note:
         ----
             This is done automatically at instantiation
             when :attr:`auto_declare` is set.
-        """ . "说明"
+        """
         for queue in self._queues.values():
             queue.declare()
 
     def register_callback(self, callback):
-        """ . "说明"Register a new callback to be called when a message is received.
+        """Register a new callback to be called when a message is received.
 
         Note:
         ----
             The signature of the callback needs to accept two arguments:
             `(body, message)`, which is the decoded message body
             and the :class:`~kombu.Message` instance.
-        """ . "说明"
-        self.callbacks.append(callback)
+        """
+        with self._restore_lock:
+            self.callbacks.append(callback)
 
     def __enter__(self):
         self.consume()
@@ -647,21 +682,31 @@ class Consumer:
                     pass
 
     def add_queue(self, queue):
-        """ . "说明"Add a queue to the list of queues to consume from.
+        """Add a queue to the list of queues to consume from.
 
         Note:
         ----
-            This will not start consuming from the queue,
-            for that you will have to call :meth:`consume` after.
-        """ . "说明"
-        queue = queue(self.channel)
-        if self.auto_declare:
-            queue.declare()
-        self._queues[queue.name] = queue
-        return queue
+            If the consumer has not been started yet (no call to
+            :meth:`consume`) this will not start consuming from the
+            queue, for that you will have to call :meth:`consume` after.
+            When the consumer is already active -- including during a
+            reconnection recovery -- the queue is consumed from
+            immediately, so a registration racing with :meth:`revive`
+            cannot be lost.
+        """
+        with self._restore_lock:
+            queue = queue(self.channel)
+            if self.auto_declare:
+                queue.declare()
+            self._queues[queue.name] = queue
+            if self._consuming:
+                # We were already consuming before this registration;
+                # mirror that state for the new queue on the live channel.
+                self._basic_consume(queue, no_ack=self.no_ack, nowait=False)
+            return queue
 
     def consume(self, no_ack=None):
-        """ . "说明"Start consuming messages.
+        """Start consuming messages.
 
         Can be called multiple times, but note that while it
         will consume from new queues added since the last call,
@@ -671,7 +716,11 @@ class Consumer:
         Arguments:
         ---------
             no_ack (bool): See :attr:`no_ack`.
-        """ . "说明"
+        """
+        with self._restore_lock:
+            return self._consume_locked(no_ack)
+
+    def _consume_locked(self, no_ack=None):
         queues = list(self._queues.values())
         if queues:
             no_ack = self.no_ack if no_ack is None else no_ack
@@ -680,52 +729,60 @@ class Consumer:
             for queue in H:
                 self._basic_consume(queue, no_ack=no_ack, nowait=True)
             self._basic_consume(T, no_ack=no_ack, nowait=False)
+            # Remember that we should be consuming: revive() replays this
+            # after a reconnection.
+            self._consuming = True
 
     def cancel(self):
-        """ . "说明"End all active queue consumers.
+        """End all active queue consumers.
 
         Note:
         ----
             This does not affect already delivered messages, but it does
             mean the server will not send any more messages for this consumer.
-        """ . "说明"
-        cancel = self.channel.basic_cancel
-        for tag in self._active_tags.values():
-            cancel(tag)
-        self._active_tags.clear()
+        """
+        with self._restore_lock:
+            cancel = self.channel.basic_cancel
+            for tag in self._active_tags.values():
+                cancel(tag)
+            self._active_tags.clear()
+            self._consuming = False
 
     close = cancel
 
     def cancel_by_queue(self, queue):
-        """ . "说明"Cancel consumer by queue name.""" . "说明"
+        """Cancel consumer by queue name."""
         qname = queue.name if isinstance(queue, Queue) else queue
-        try:
-            tag = self._active_tags.pop(qname)
-        except KeyError:
-            pass
-        else:
-            self.channel.basic_cancel(tag)
-        finally:
-            self._queues.pop(qname, None)
+        with self._restore_lock:
+            try:
+                tag = self._active_tags.pop(qname)
+            except KeyError:
+                pass
+            else:
+                self.channel.basic_cancel(tag)
+            finally:
+                self._queues.pop(qname, None)
+            if not self._queues:
+                self._consuming = False
 
     def consuming_from(self, queue):
-        """ . "说明"Return :const:`True` if currently consuming from queue'.""" . "说明"
+        """Return :const:`True` if currently consuming from queue'."""
         name = queue
         if isinstance(queue, Queue):
             name = queue.name
         return name in self._active_tags
 
     def purge(self):
-        """ . "说明"Purge messages from all queues.
+        """Purge messages from all queues.
 
         Warning:
         -------
             This will *delete all ready messages*, there is no undo operation.
-        """ . "说明"
+        """
         return sum(queue.purge() for queue in self._queues.values())
 
     def flow(self, active):
-        """ . "说明"Enable/disable flow from peer.
+        """Enable/disable flow from peer.
 
         This is a simple flow-control mechanism that a peer can use
         to avoid overflowing its queues or otherwise finding itself
@@ -734,11 +791,11 @@ class Consumer:
         The peer that receives a request to stop sending content
         will finish sending the current content (if any), and then wait
         until flow is reactivated.
-        """ . "说明"
+        """
         self.channel.flow(active)
 
     def qos(self, prefetch_size=0, prefetch_count=0, apply_global=False):
-        """ . "说明"Specify quality of service.
+        """Specify quality of service.
 
         The client can request that messages should be sent in
         advance so that when the client finishes processing a message,
@@ -761,13 +818,13 @@ class Consumer:
                 whole messages.
 
             apply_global (bool): Apply new settings globally on all channels.
-        """ . "说明"
+        """
         return self.channel.basic_qos(prefetch_size,
                                       prefetch_count,
                                       apply_global)
 
     def recover(self, requeue=False):
-        """ . "说明"Redeliver unacknowledged messages.
+        """Redeliver unacknowledged messages.
 
         Asks the broker to redeliver all unacknowledged messages
         on the specified channel.
@@ -778,11 +835,11 @@ class Consumer:
                 to the original recipient. With `requeue` set to true, the
                 server will attempt to requeue the message, potentially then
                 delivering it to an alternative subscriber.
-        """ . "说明"
+        """
         return self.channel.basic_recover(requeue=requeue)
 
     def receive(self, body, message):
-        """ . "说明"Method called when a message is received.
+        """Method called when a message is received.
 
         This dispatches to the registered :attr:`callbacks`.
 
@@ -795,7 +852,7 @@ class Consumer:
         ------
             NotImplementedError: If no consumer callbacks have been
                 registered.
-        """ . "说明"
+        """
         callbacks = self.callbacks
         if not callbacks:
             raise NotImplementedError('Consumer does not have any callbacks')

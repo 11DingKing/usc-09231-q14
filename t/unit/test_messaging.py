@@ -4,6 +4,7 @@ import pickle
 import sys
 import threading
 from collections import defaultdict
+from itertools import count
 from unittest.mock import ANY, Mock, patch
 
 import pytest
@@ -1093,3 +1094,167 @@ class test_Consumer:
         p = self.connection.Consumer()
         p.channel = object()
         assert p.connection is None
+
+    def test_revive_restores_active_consumption_on_new_channel(self):
+        # After a short disconnect the connection is back but every
+        # consumer tag registered on the dead channel is gone. revive()
+        # must replay the previously active consumption state, otherwise
+        # messages stay in the unprocessed queue.
+        channel = self.connection.channel()
+        q1 = Queue('qname1', self.exchange, 'rkey')
+        q2 = Queue('qname2', self.exchange, 'rkey')
+        consumer = Consumer(channel, [q1, q2])
+        consumer.consume()
+        assert channel.called.count('basic_consume') == 2
+
+        new_channel = self.connection.channel()
+        consumer.revive(new_channel)
+
+        # every previously consumed queue is registered again, once
+        assert consumer.channel is new_channel
+        assert consumer.consuming_from('qname1')
+        assert consumer.consuming_from('qname2')
+        assert new_channel.called.count('basic_consume') == 2
+        # nothing remains registered on the dead channel
+        assert not channel is consumer.channel
+
+    def test_revive_without_active_consumption_does_not_consume(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('qname1', self.exchange, 'rkey')])
+        assert not consumer._consuming
+
+        new_channel = self.connection.channel()
+        consumer.revive(new_channel)
+
+        assert 'basic_consume' not in new_channel
+        assert not consumer.consuming_from('qname1')
+
+    def test_revive_is_idempotent_for_the_same_reconnection(self):
+        # The retry machinery can trigger more than one recovery callback
+        # for the same reconnection; replaying twice must not double-register.
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('qname1', self.exchange, 'rkey')])
+        consumer.consume()
+
+        new_channel = self.connection.channel()
+        consumer.revive(new_channel)
+        basic_consumes_after_first = new_channel.called.count('basic_consume')
+        consumer.revive(new_channel)
+        consumer.revive(new_channel)
+
+        assert new_channel.called.count('basic_consume') == \
+            basic_consumes_after_first
+        assert len(consumer._active_tags) == 1
+
+    def test_add_queue_while_consuming_is_registered_immediately(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('q1', self.exchange, 'r1')])
+        consumer.consume()
+
+        consumer.add_queue(Queue('q2', self.exchange, 'r2'))
+        assert consumer.consuming_from('q2')
+        # and a subsequent revive must not lose the late registrant
+        new_channel = self.connection.channel()
+        consumer.revive(new_channel)
+        assert consumer.consuming_from('q1')
+        assert consumer.consuming_from('q2')
+
+    def test_connection_retry_restores_consumer_before_retry_runs(self):
+        # Ordering: retry -> revive(consumer) -> on_revive -> retried call.
+        # The retried action must already see the restored consumer.
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('q1', self.exchange, 'rkey')])
+        consumer.consume()
+        revived_channel = []
+        attempts = count()
+
+        conn_error = self.connection.connection_errors[0]
+
+        def action():
+            attempt = next(attempts)
+            if attempt == 0:
+                raise conn_error('connection reset by peer')
+            # running on the new channel after recovery
+            assert consumer.channel is revived_channel[0]
+            assert consumer.consuming_from('q1')
+            assert 'basic_consume' in consumer.channel
+            return 'delivered'
+
+        def on_revive(new_channel):
+            revived_channel.append(new_channel)
+
+        ensured = self.connection.ensure(
+            consumer, action, on_revive=on_revive,
+            max_retries=1, interval_start=0, interval_step=0, interval_max=0,
+        )
+        assert ensured() == 'delivered'
+        assert revived_channel
+
+    def test_parallel_revive_and_add_queue_keeps_consistent_state(self):
+        # Simulate repeated disconnect/reconnect cycles racing with
+        # parallel queue registration: no registrant may be lost or left
+        # without an active consumer tag.
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('base', self.exchange, 'r')])
+        consumer.consume()
+        errors = []
+
+        def revive_loop():
+            try:
+                for _ in range(50):
+                    consumer.revive(self.connection.channel())
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def register_loop():
+            try:
+                for index in range(50):
+                    consumer.add_queue(
+                        Queue(f'dyn{index}', self.exchange, f'd{index}'))
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=revive_loop),
+                   threading.Thread(target=register_loop)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors
+        # one active tag per registered queue, all on the live channel
+        assert set(consumer._active_tags) == set(consumer._queues)
+        assert consumer.channel.called.count('basic_consume') == \
+            len(consumer._queues)
+        for queue in consumer.queues:
+            assert queue.channel is consumer.channel
+
+    def test_parallel_register_callback_survives_repeated_revive(self):
+        consumer = Consumer(self.connection.channel(),
+                            [Queue('solo', self.exchange, 'rkey')])
+        errors = []
+        thread_count = 4
+        callbacks_per_thread = 200
+
+        def register_loop():
+            try:
+                for index in range(callbacks_per_thread):
+                    consumer.register_callback(
+                        lambda body, message, i=index: i)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=register_loop)
+                   for _ in range(thread_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors
+        expected = thread_count * callbacks_per_thread
+        assert len(consumer.callbacks) == expected
+        # repeated, possibly duplicate, recovery keeps callbacks intact
+        consumer.revive(self.connection.channel())
+        consumer.revive(consumer.channel)
+        assert len(consumer.callbacks) == expected
